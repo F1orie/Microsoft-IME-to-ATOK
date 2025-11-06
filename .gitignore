@@ -1,3 +1,5 @@
 .venv/
 build/
 dist/
+ATOK_app.spec
+image.png
