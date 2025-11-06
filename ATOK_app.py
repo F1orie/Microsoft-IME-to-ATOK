@@ -2,9 +2,12 @@ import flet as ft
 import re, unicodedata, os
 from pathlib import Path
 
-# 変換
-_RE_ASCII_DOUBLE = re.compile(r"([b-df-hj-km-pr-tv-z])\1+", re.I)
 _ROMAN_RUN = re.compile(r"[A-Za-z']+|[Ａ-Ｚａ-ｚ＇]+")
+
+# 対象子音（nは除外）
+def _is_target_consonant(ch: str) -> bool:
+    c = ch.lower()
+    return ("a" <= c <= "z") and (c not in "aeiouv" and c != "n")
 
 def _is_fullwidth_run(s: str) -> bool:
     has_fw = any("Ａ" <= ch <= "Ｚ" or "ａ" <= ch <= "ｚ" for ch in s)
@@ -22,8 +25,40 @@ def _to_fullwidth_letters(s: str) -> str:
             out.append(ch)
     return "".join(out)
 
+def _convert_roman_run_to_atok(run: str) -> str:
+    was_full = _is_fullwidth_run(run)
+    s = unicodedata.normalize("NFKC", run) 
+
+    out = []
+    i = 0
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if _is_target_consonant(ch):
+            j = i + 1
+            while j < n and s[j].lower() == ch.lower():
+                j += 1
+            L = j - i
+            if L >= 2:
+                last_char = s[j - 1]
+                out.append("っ" * (L - 1) + last_char)
+                i = j
+                continue
+            else:
+                out.append(ch)
+                i += 1
+                continue
+        else:
+            out.append(ch)
+            i += 1
+
+    result = "".join(out)
+    if was_full:
+        result = _to_fullwidth_letters(result)
+    return result
+
 def convert_first_field(line: str) -> str:
-    """TSVの1列目だけ、n以外の連続子音(2+)→『っ』。タブが無ければ素通し。"""
+    """TSVの1列目だけ変換"""
     if "\t" not in line:
         return line
     first, rest = line.split("\t", 1)
@@ -32,12 +67,7 @@ def convert_first_field(line: str) -> str:
     for m in _ROMAN_RUN.finditer(first):
         out.append(first[i:m.start()])
         run = first[m.start():m.end()]
-        was_full = _is_fullwidth_run(run)
-        ascii_run = unicodedata.normalize("NFKC", run).lower()
-        conv = _RE_ASCII_DOUBLE.sub("っ", ascii_run)
-        if was_full:
-            conv = _to_fullwidth_letters(conv)
-        out.append(conv)
+        out.append(_convert_roman_run_to_atok(run))
         i = m.end()
     out.append(first[i:])
     return "".join(out) + "\t" + rest
@@ -55,48 +85,28 @@ def convert_text(text: str):
             diffs.append(f"[{idx}] {ln}  ⇒  {new_ln}")
     return "\n".join(out_lines), changed, "\n".join(diffs)
 
-# UI 
+# UI
 def main(page: ft.Page):
     page.title = "Meriem"
     page.window_min_width = 980
     page.window_min_height = 700
     page.theme_mode = ft.ThemeMode.LIGHT
 
-    # 状態
     current_file: Path | None = None
     input_text = ""
     output_text = ""
     diff_text = ""
 
-    # ウィジェット
     stat = ft.Text("準備OK", size=12, color=ft.Colors.GREY_700)
     changed_txt = ft.Text("変更行: 0 / 総行数: 0", size=12)
 
     mono = ft.TextStyle(font_family="Consolas", size=13)
-    input_tf = ft.TextField(
-        label="入力（原文）",
-        multiline=True,
-        read_only=True,
-        text_style=mono,
-        min_lines=16,
-        expand=True,
-    )
-    output_tf = ft.TextField(
-        label="出力（変換後）",
-        multiline=True,
-        read_only=True,
-        text_style=mono,
-        min_lines=16,
-        expand=True,
-    )
-    diff_tf = ft.TextField(
-        label="差分",
-        multiline=True,
-        read_only=True,
-        text_style=mono,
-        min_lines=8,
-        expand=True,
-    )
+    input_tf = ft.TextField(label="入力（原文）", multiline=True, read_only=True,
+                            text_style=mono, min_lines=16, expand=True)
+    output_tf = ft.TextField(label="出力（変換後）", multiline=True, read_only=True,
+                             text_style=mono, min_lines=16, expand=True)
+    diff_tf = ft.TextField(label="差分", multiline=True, read_only=True,
+                           text_style=mono, min_lines=8, expand=True)
 
     open_picker = ft.FilePicker()
     save_picker = ft.FilePicker()
