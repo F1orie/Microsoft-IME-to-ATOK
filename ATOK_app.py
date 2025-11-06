@@ -7,7 +7,7 @@ _ROMAN_RUN = re.compile(r"[A-Za-z']+|[Ａ-Ｚａ-ｚ＇]+")
 # 対象子音（nは除外）
 def _is_target_consonant(ch: str) -> bool:
     c = ch.lower()
-    return ("a" <= c <= "z") and (c not in "aeiouv" and c != "n")
+    return ("a" <= c <= "z") and (c not in "aeiou" and c != "n")
 
 def _is_fullwidth_run(s: str) -> bool:
     has_fw = any("Ａ" <= ch <= "Ｚ" or "ａ" <= ch <= "ｚ" for ch in s)
@@ -27,7 +27,7 @@ def _to_fullwidth_letters(s: str) -> str:
 
 def _convert_roman_run_to_atok(run: str) -> str:
     was_full = _is_fullwidth_run(run)
-    s = unicodedata.normalize("NFKC", run) 
+    s = unicodedata.normalize("NFKC", run)
 
     out = []
     i = 0
@@ -73,7 +73,7 @@ def convert_first_field(line: str) -> str:
     return "".join(out) + "\t" + rest
 
 def convert_text(text: str):
-    """全文変換。戻り値: (出力テキスト, 変更行数, 差分テキスト)"""
+    """戻り値: (出力テキスト, 変更行数, 差分テキスト)"""
     in_lines = text.splitlines()
     out_lines, diffs = [], []
     changed = 0
@@ -82,7 +82,7 @@ def convert_text(text: str):
         out_lines.append(new_ln)
         if new_ln != ln:
             changed += 1
-            diffs.append(f"[{idx}] {ln}  ⇒  {new_ln}")
+            diffs.append(f"[{idx}行目] {ln}  ⇒  {new_ln}")
     return "\n".join(out_lines), changed, "\n".join(diffs)
 
 # UI
@@ -122,7 +122,7 @@ def main(page: ft.Page):
         try:
             txt = Path(path).read_text(encoding="cp932")
         except Exception as e:
-            set_status(f"読み込み失敗: {e}", ok=False)
+            set_status(f"読み込み失敗:フォーマットや文字コードを確認してください", ok=False)
             return
         input_text = txt
         output_text, changed, diff_text = convert_text(txt)
@@ -199,12 +199,30 @@ def main(page: ft.Page):
         tabs=[ft.Tab(text="プレビュー", content=single_tab_content)],
     )
 
+    # AppBar は page.appbar へ
+    page.appbar = ft.AppBar(title=ft.Text("Microsoft IME→ATOK変換器"))
+
+    # 画面全体を Dropzone で包み、OSからの D&D を受ける
+    def _on_dropped(e):
+        try:
+            files = getattr(e, "files", None)
+            if files and len(files) > 0:
+                p = files[0].path
+                if p:
+                    load_file(Path(p))
+        except Exception as ex:
+            set_status(f"ドロップ処理に失敗しました: {ex}", ok=False)
+
     page.add(
-        ft.AppBar(title=ft.Text("Microsoft IME→ATOK変換器")),
-        ft.Container(content=top_bar, padding=10),
-        ft.Container(content=panes, padding=10, expand=True),
-        ft.Container(content=stat, padding=10),
+        ft.Column(
+            controls=[
+                ft.Container(content=top_bar, padding=10),
+                ft.Container(content=panes, padding=10, expand=True),
+                ft.Container(content=stat, padding=10),
+            ],
+            expand=True,
+        )
     )
 
 if __name__ == "__main__":
-    ft.app(target=main)
+    ft.app(target=main, view=ft.AppView.FLET_APP)
