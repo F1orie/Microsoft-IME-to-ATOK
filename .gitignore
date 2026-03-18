@@ -1,5 +1,6 @@
 .venv/
+venv_desk/
 build/
 dist/
-ATOK_app.spec
-image.png
+share/
+docs/
