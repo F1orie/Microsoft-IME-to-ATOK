@@ -10,6 +10,7 @@ from pathlib import Path
 
 _ROMAN_RUN = re.compile(r"[A-Za-z']+|[Ａ-Ｚａ-ｚ＇]+")
 _POS_COMMENT_SPLIT = re.compile(r"^(\S+)\s{2,}(.*)$")
+_DISALLOWED_READING_CHARS = re.compile(r"[^ぁ-ゖ゛゜0-9０-９A-Za-zＡ-Ｚａ-ｚ]+")
 
 # 読み（A列）正規化: 濁点・半濁点（結合文字/分離記号）
 _DAKUTEN_MARKS = frozenset(("\u3099", "\u309a", "\u309b", "\u309c"))
@@ -123,9 +124,10 @@ def _is_allowed_reading_char(ch: str) -> bool:
 
 
 def _filter_reading_column(s: str) -> str:
-    """機能2: 許可外文字を削除。"""
+    """機能2: ひらがな・数字・英字以外を削除して左詰め。"""
     s = unicodedata.normalize("NFC", s)
-    return "".join(ch for ch in s if _is_allowed_reading_char(ch))
+    # 「、」「。」「．」「・」「？」「！」などの記号を除去
+    return _DISALLOWED_READING_CHARS.sub("", s)
 
 
 def _truncate_reading_at_count32(s: str) -> str:
