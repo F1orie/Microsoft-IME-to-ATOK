@@ -5,3 +5,4 @@ dist/
 share/
 docs/
 venv-note/
+_pycache_/

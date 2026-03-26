@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 try:
-    import flet as ft
+    import flet as ft  # type: ignore[import-not-found]
 except ModuleNotFoundError:  # 変換ロジックの単体利用向け（UI起動時は必要）
     ft = None  # type: ignore[assignment]
 import re, unicodedata
@@ -231,11 +231,12 @@ def convert_first_field(line: str) -> str:
     return "".join(out) + "\t" + rest
 
 def _blank_pos_column_in_tsv(line: str) -> str:
-    """TSVの3列目（品詞）を空欄にする。
+    """TSVの品詞無し出力へ整形（語句・品詞は出さず、タブ2連続でコメント列へ）。
 
-    期待例:
-    - ① 読み\t語句\t品詞\tコメント -> 品詞無し: 読み\t語句\t\tコメント
-    - ② 読み\t語句\t\tコメント -> そのまま（3列目が空欄なので不変）
+    期待例（品詞無し）:
+    - ① 読み\t語句\t品詞\tコメント -> 読み\t\tコメント
+    - ② 読み\t品詞\tコメント -> 読み\t\tコメント
+    - ③ 読み\t語句\t品詞  コメント -> 読み\t\tコメント
     """
     if "\t" not in line:
         return line
@@ -257,21 +258,20 @@ def _blank_pos_column_in_tsv(line: str) -> str:
             },
         )
     # #endregion
-    # 正規想定: 4 列 (読み, 語句, 品詞, コメント)
-    # ただし実データでは 3 列のケースがあり、その場合は列の意味がズレるため
-    # 「品詞無し」でもコメントが消えないように整形する。
+    # 入力は基本 4 列想定だが、実データの揺れ（3 列など）でも
+    # コメントが消えないように「読み + 空欄列 + コメント」で統一する。
     if len(parts) == 4:
-        parts[2] = ""
-        return "\t".join(parts)
+        # [0]=読み, [1]=語句, [2]=品詞, [3]=コメント
+        return "\t".join([parts[0], "", parts[3]])
 
     if len(parts) == 3:
         # ケースA: 3列目が「品詞(単語)+  コメント」で2+スペース区切りになっている
         #   例: 読み\t語句\t名詞  拠点/造語
         m = _POS_COMMENT_SPLIT.match(parts[2])
         if m:
-            # 品詞は捨てて、コメントだけ残す（結果は4列化して「品詞列」を空欄にする）
+            # 品詞は捨てて、コメントだけ残す（読み\t\tコメント）
             comment = m.group(2).strip()
-            out = [parts[0], parts[1], "", comment]
+            out = [parts[0], "", comment]
             # #region agent log (pos blank normalize len=3 caseA)
             _debug_log(
                 hypothesisId="H1_COLCOUNT_FIX",
@@ -284,7 +284,7 @@ def _blank_pos_column_in_tsv(line: str) -> str:
 
         # ケースB: 2列目が品詞で、3列目がコメント（語句列が欠落）
         #   例: 読み\t名詞\tコメント
-        out = [parts[0], "", "", parts[2]]
+        out = [parts[0], "", parts[2]]
         # #region agent log (pos blank normalize len=3 caseB)
         _debug_log(
             hypothesisId="H1_COLCOUNT_FIX",
@@ -295,9 +295,10 @@ def _blank_pos_column_in_tsv(line: str) -> str:
         # #endregion
         return "\t".join(out)
 
-    # 想定外: 5列以上など。とにかく 3列目を空欄にする（タブ構造は維持）
-    parts[2] = ""
-    return "\t".join(parts)
+    # 想定外: 5列以上など。とにかく読み\t\tコメントにまとめる（コメントは最後）
+    reading = parts[0]
+    comment = parts[-1]
+    return "\t".join([reading, "", comment])
 
 def _convert_pos_column_exact(line: str) -> str:
     """TSVの3列目（品詞）を辞書で完全一致置換する。"""
@@ -368,7 +369,7 @@ def convert_text(text: str, include_pos: bool = True):
 
 # UI
 def main(page: ft.Page):
-    page.title = "Meriem"
+    page.title = "Meriem ver.1.1"
     page.window_min_width = 980
     page.window_min_height = 700
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -516,17 +517,6 @@ def main(page: ft.Page):
 
     # AppBar は page.appbar へ
     page.appbar = ft.AppBar(title=ft.Text("Microsoft IME→ATOK変換器"))
-
-    # 画面全体を Dropzone で包み、OSからの D&D を受ける
-    def _on_dropped(e):
-        try:
-            files = getattr(e, "files", None)
-            if files and len(files) > 0:
-                p = files[0].path
-                if p:
-                    load_file(Path(p))
-        except Exception as ex:
-            set_status(f"ドロップ処理に失敗しました: {ex}", ok=False)
 
     page.add(
         ft.Column(
