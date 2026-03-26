@@ -1,8 +1,165 @@
-import flet as ft
-import re, unicodedata, os
+from __future__ import annotations
+
+try:
+    import flet as ft
+except ModuleNotFoundError:  # 変換ロジックの単体利用向け（UI起動時は必要）
+    ft = None  # type: ignore[assignment]
+import re, unicodedata
+import json, time
 from pathlib import Path
 
 _ROMAN_RUN = re.compile(r"[A-Za-z']+|[Ａ-Ｚａ-ｚ＇]+")
+_POS_COMMENT_SPLIT = re.compile(r"^(\S+)\s{2,}(.*)$")
+
+# 読み（A列）正規化: 濁点・半濁点（結合文字/分離記号）
+_DAKUTEN_MARKS = frozenset(("\u3099", "\u309a", "\u309b", "\u309c"))
+# カタカナ「ヴ」→ ひらがな「う」+ 分離濁点「゛」（ゔ に合成されない表記）
+_U_VOICED = "\u3046\u309b"
+_VU_KATAKANA = "\u30f4"
+
+# 品詞ラベル（3列目）の完全一致置換辞書
+_POS_LABEL_MAP_RAW: dict[str, str] = {
+    "固有名詞": "固有一般",
+    "姓": "固有人名",
+    "地名その他": "固有地名",
+    "さ変名詞": "名詞サ変",
+    "ざ変名詞": "名詞ザ変",
+    "か行五段": "カ行五段",
+    "が行五段": "ガ行五段",
+    "さ行五段": "サ行五段",
+    "た行五段": "タ行五段",
+    "な行五段": "ナ行五段",
+    "は行五段": "ハ行五段",
+    "ば行五段": "バ行五段",
+    "ま行五段": "マ行五段",
+    "ら行五段": "ラ行五段",
+    "あわ行五段": "アワ行五段",
+}
+
+# 念のため、キーは実装前に NFKC 正規化して同一化
+_POS_LABEL_MAP: dict[str, str] = {
+    unicodedata.normalize("NFKC", k): v for k, v in _POS_LABEL_MAP_RAW.items()
+}
+
+_DEBUG_LOG_PATH = Path(__file__).resolve().parent / "debug-85397b.log"
+_DEBUG_SESSION_ID = "85397b"
+_DEBUG_RUN_ID = "pre-fix"
+
+
+def _append_debug_ndjson(payload: dict) -> None:
+    # NDJSON (one JSON object per line) を追記
+    payload = dict(payload)
+    payload.setdefault("timestamp", int(time.time() * 1000))
+    with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+        f.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+
+def _debug_log(
+    hypothesisId: str,
+    location: str,
+    message: str,
+    data: dict | None = None,
+) -> None:
+    # ルール: secrets/PIIは入れない。必要なら preview を短くする。
+    _append_debug_ndjson(
+        {
+            "sessionId": _DEBUG_SESSION_ID,
+            "runId": _DEBUG_RUN_ID,
+            "hypothesisId": hypothesisId,
+            "location": location,
+            "message": message,
+            "data": data or {},
+        }
+    )
+
+
+def _reading_units(s: str) -> list[str]:
+    """NFD クラスタごとに分割し、各要素を NFC の最短表現に戻す。"""
+    s = unicodedata.normalize("NFC", s)
+    s_nfd = unicodedata.normalize("NFD", s)
+    parts: list[str] = []
+    i, n = 0, len(s_nfd)
+    while i < n:
+        ch = s_nfd[i]
+        if unicodedata.combining(ch):
+            i += 1
+            continue
+        j = i + 1
+        while j < n and unicodedata.combining(s_nfd[j]):
+            j += 1
+        parts.append(unicodedata.normalize("NFC", s_nfd[i:j]))
+        i = j
+    return parts
+
+
+def _reading_unit_weight(unit: str) -> int:
+    """仕様: 濁点・半濁点付きは 2 カウント、それ以外は 1。"""
+    nfd = unicodedata.normalize("NFD", unit)
+    return 2 if any(c in _DAKUTEN_MARKS for c in nfd) else 1
+
+
+def _replace_vu_in_reading(s: str) -> str:
+    """機能3: ヴ → う゛（結合濁点）。"""
+    return s.replace(_VU_KATAKANA, _U_VOICED)
+
+
+def _is_allowed_reading_char(ch: str) -> bool:
+    """機能2: ひらがな・数字・英字のみ許可（半角・全角）。"""
+    o = ord(ch)
+    if 0x3041 <= o <= 0x3096:
+        return True
+    # 分離濁点/半濁点（「う゛」の゛を残す）
+    if ch == "\u309b" or ch == "\u309c":
+        return True
+    if "0" <= ch <= "9":
+        return True
+    if 0xFF10 <= o <= 0xFF19:
+        return True
+    if "A" <= ch <= "Z" or "a" <= ch <= "z":
+        return True
+    if 0xFF21 <= o <= 0xFF3A or 0xFF41 <= o <= 0xFF5A:
+        return True
+    return False
+
+
+def _filter_reading_column(s: str) -> str:
+    """機能2: 許可外文字を削除。"""
+    s = unicodedata.normalize("NFC", s)
+    return "".join(ch for ch in s if _is_allowed_reading_char(ch))
+
+
+def _truncate_reading_at_count32(s: str) -> str:
+    """機能1: 独自カウントで 32 以上なら 32 カウント目を @ にし、以降を削除。"""
+    s = unicodedata.normalize("NFC", s)
+    units = _reading_units(s)
+    if not units:
+        return s
+    weights = [_reading_unit_weight(u) for u in units]
+    if sum(weights) < 32:
+        return s
+    out: list[str] = []
+    cum = 0
+    for u, w in zip(units, weights):
+        if cum >= 32:
+            break
+        if cum + w <= 31:
+            out.append(u)
+            cum += w
+        else:
+            # 32 カウント目がこのユニットにかかる → ユニット全体を @（仕様メモ）
+            out.append("@")
+            break
+    return "".join(out)
+
+
+def _normalize_reading_column_a(first: str) -> str:
+    """読み列の 3→2→1（その後に英字→促音を適用）。"""
+    s = unicodedata.normalize("NFKC", first)
+    s = _replace_vu_in_reading(s)
+    s = _filter_reading_column(s)
+    s = _truncate_reading_at_count32(s)
+    return s
+
 
 # 対象子音（nは除外）
 def _is_target_consonant(ch: str) -> bool:
@@ -62,6 +219,7 @@ def convert_first_field(line: str) -> str:
     if "\t" not in line:
         return line
     first, rest = line.split("\t", 1)
+    first = _normalize_reading_column_a(first)
 
     out, i = [], 0
     for m in _ROMAN_RUN.finditer(first):
@@ -72,13 +230,136 @@ def convert_first_field(line: str) -> str:
     out.append(first[i:])
     return "".join(out) + "\t" + rest
 
-def convert_text(text: str):
+def _blank_pos_column_in_tsv(line: str) -> str:
+    """TSVの3列目（品詞）を空欄にする。
+
+    期待例:
+    - ① 読み\t語句\t品詞\tコメント -> 品詞無し: 読み\t語句\t\tコメント
+    - ② 読み\t語句\t\tコメント -> そのまま（3列目が空欄なので不変）
+    """
+    if "\t" not in line:
+        return line
+    parts = line.split("\t")
+    if len(parts) < 3:
+        return line
+    # #region agent log (pos blank with unexpected column count)
+    if len(parts) != 4:
+        _debug_log(
+            hypothesisId="H1_COLCOUNT",
+            location="_blank_pos_column_in_tsv",
+            message="blank_pos_called_with_non4_columns",
+            data={
+                "split_len": len(parts),
+                "tabs": line.count("\t"),
+                "parts_preview": parts[:5],
+                "pos_before": parts[2] if len(parts) > 2 else None,
+                "line_preview": line[:120],
+            },
+        )
+    # #endregion
+    # 正規想定: 4 列 (読み, 語句, 品詞, コメント)
+    # ただし実データでは 3 列のケースがあり、その場合は列の意味がズレるため
+    # 「品詞無し」でもコメントが消えないように整形する。
+    if len(parts) == 4:
+        parts[2] = ""
+        return "\t".join(parts)
+
+    if len(parts) == 3:
+        # ケースA: 3列目が「品詞(単語)+  コメント」で2+スペース区切りになっている
+        #   例: 読み\t語句\t名詞  拠点/造語
+        m = _POS_COMMENT_SPLIT.match(parts[2])
+        if m:
+            # 品詞は捨てて、コメントだけ残す（結果は4列化して「品詞列」を空欄にする）
+            comment = m.group(2).strip()
+            out = [parts[0], parts[1], "", comment]
+            # #region agent log (pos blank normalize len=3 caseA)
+            _debug_log(
+                hypothesisId="H1_COLCOUNT_FIX",
+                location="_blank_pos_column_in_tsv",
+                message="blank_pos_norm_len3_caseA_split_pos_comment",
+                data={"parts_preview": parts[:5], "comment": comment, "tabs_in": line.count("\t")},
+            )
+            # #endregion
+            return "\t".join(out)
+
+        # ケースB: 2列目が品詞で、3列目がコメント（語句列が欠落）
+        #   例: 読み\t名詞\tコメント
+        out = [parts[0], "", "", parts[2]]
+        # #region agent log (pos blank normalize len=3 caseB)
+        _debug_log(
+            hypothesisId="H1_COLCOUNT_FIX",
+            location="_blank_pos_column_in_tsv",
+            message="blank_pos_norm_len3_caseB_pos_in_col2",
+            data={"parts_preview": parts[:5], "tabs_in": line.count("\t")},
+        )
+        # #endregion
+        return "\t".join(out)
+
+    # 想定外: 5列以上など。とにかく 3列目を空欄にする（タブ構造は維持）
+    parts[2] = ""
+    return "\t".join(parts)
+
+def _convert_pos_column_exact(line: str) -> str:
+    """TSVの3列目（品詞）を辞書で完全一致置換する。"""
+    if "\t" not in line:
+        return line
+    parts = line.split("\t")
+    if len(parts) < 3:
+        return line
+
+    pos = parts[2]
+    pos_norm = unicodedata.normalize("NFKC", pos)
+    mapped = _POS_LABEL_MAP.get(pos_norm)
+    if mapped is None or mapped == pos:
+        return line
+
+    parts[2] = mapped
+    return "\t".join(parts)
+
+
+def convert_text(text: str, include_pos: bool = True):
     """戻り値: (出力テキスト, 変更行数, 差分テキスト)"""
     in_lines = text.splitlines()
     out_lines, diffs = [], []
     changed = 0
     for idx, ln in enumerate(in_lines, start=1):
+        # #region agent log (input TSV split shape)
+        if "\t" in ln:
+            parts_len = len(ln.split("\t"))
+            if parts_len != 4:
+                _debug_log(
+                    hypothesisId="H1_COLCOUNT",
+                    location="convert_text",
+                    message="input_tsv_split_len_not_4",
+                    data={
+                        "idx": idx,
+                        "include_pos": include_pos,
+                        "split_len": parts_len,
+                        "tabs": ln.count("\t"),
+                        "parts_preview": ln.split("\t")[:5],
+                        "line_preview": ln[:120],
+                    },
+                )
+        # #endregion
         new_ln = convert_first_field(ln) if "\t" in ln else ln
+        # #region agent log (tab count stability after first-field conversion)
+        if "\t" in ln and (len(ln.split("\t")) != 4):
+            _debug_log(
+                hypothesisId="H4_TAB_STABILITY",
+                location="convert_text_after_convert_first_field",
+                message="tab_count_change_after_first_field",
+                data={
+                    "idx": idx,
+                    "tabs_in": ln.count("\t"),
+                    "tabs_out": new_ln.count("\t"),
+                    "out_preview": new_ln[:120],
+                },
+            )
+        # #endregion
+        if include_pos:
+            new_ln = _convert_pos_column_exact(new_ln)
+        else:
+            new_ln = _blank_pos_column_in_tsv(new_ln)
         out_lines.append(new_ln)
         if new_ln != ln:
             changed += 1
@@ -99,6 +380,7 @@ def main(page: ft.Page):
 
     stat = ft.Text("準備OK", size=12, color=ft.Colors.GREY_700)
     changed_txt = ft.Text("変更行: 0 / 総行数: 0", size=12)
+    include_pos = True  # True: 品詞あり（既存の出力と同じ）, False: 品詞無し（3列目を空欄）
 
     mono = ft.TextStyle(font_family="Consolas", size=13)
     input_tf = ft.TextField(label="入力（原文）", multiline=True, read_only=True,
@@ -107,6 +389,21 @@ def main(page: ft.Page):
                              text_style=mono, min_lines=16, expand=True)
     diff_tf = ft.TextField(label="差分", multiline=True, read_only=True,
                            text_style=mono, min_lines=8, expand=True)
+
+    def refresh_output():
+        """input_text を include_pos に応じて再変換し、UIへ反映する。"""
+        nonlocal output_text, diff_text
+        if not input_text:
+            output_text, diff_text = "", ""
+            output_tf.value = ""
+            diff_tf.value = ""
+            changed_txt.value = "変更行: 0 / 総行数: 0"
+            return
+
+        output_text, changed, diff_text = convert_text(input_text, include_pos=include_pos)
+        output_tf.value = output_text
+        diff_tf.value = diff_text
+        changed_txt.value = f"変更行: {changed} / 総行数: {len(input_text.splitlines())}"
 
     open_picker = ft.FilePicker()
     save_picker = ft.FilePicker()
@@ -125,11 +422,8 @@ def main(page: ft.Page):
             set_status(f"読み込み失敗:フォーマットや文字コードを確認してください", ok=False)
             return
         input_text = txt
-        output_text, changed, diff_text = convert_text(txt)
         input_tf.value = input_text
-        output_tf.value = output_text
-        diff_tf.value = diff_text
-        changed_txt.value = f"変更行: {changed} / 総行数: {len(input_text.splitlines())}"
+        refresh_output()
         current_file = Path(path)
         set_status(f"読み込み完了: {current_file.name}（ANSI）")
 
@@ -178,9 +472,30 @@ def main(page: ft.Page):
 
     save_picker.on_result = on_save_result
 
+    def on_pos_yes_click(e):
+        nonlocal include_pos
+        include_pos = True
+        pos_yes_btn.disabled = True
+        pos_no_btn.disabled = False
+        refresh_output()
+        page.update()
+
+    def on_pos_no_click(e):
+        nonlocal include_pos
+        include_pos = False
+        pos_yes_btn.disabled = False
+        pos_no_btn.disabled = True
+        refresh_output()
+        page.update()
+
+    pos_yes_btn = ft.ElevatedButton("品詞あり", disabled=True, on_click=on_pos_yes_click)
+    pos_no_btn = ft.OutlinedButton("品詞無し", disabled=False, on_click=on_pos_no_click)
+    pos_toggle = ft.Row(controls=[pos_yes_btn, pos_no_btn], spacing=10)
+
     top_bar = ft.Row(
         controls=[
             ft.ElevatedButton("ファイルを選択", icon=ft.Icons.FOLDER_OPEN, on_click=on_open_click),
+            pos_toggle,
             ft.OutlinedButton("出力をコピー", icon=ft.Icons.CONTENT_COPY, on_click=on_copy_output),
             ft.FilledTonalButton("出力を保存", icon=ft.Icons.SAVE, on_click=on_save_click),
             ft.Container(expand=True),
@@ -225,4 +540,6 @@ def main(page: ft.Page):
     )
 
 if __name__ == "__main__":
+    if ft is None:
+        raise SystemExit("flet が見つかりません。venv を有効化してから起動してください。")
     ft.app(target=main, view=ft.AppView.FLET_APP)
