@@ -10,7 +10,8 @@ from pathlib import Path
 
 _ROMAN_RUN = re.compile(r"[A-Za-z']+|[Ａ-Ｚａ-ｚ＇]+")
 _POS_COMMENT_SPLIT = re.compile(r"^(\S+)\s{2,}(.*)$")
-_DISALLOWED_READING_CHARS = re.compile(r"[^ぁ-ゖ゛゜0-9０-９A-Za-zＡ-Ｚａ-ｚ]+")
+# 長音記号「ー」(U+30FC) を読み列に許可
+_DISALLOWED_READING_CHARS = re.compile(r"[^ぁ-ゖ゛゜ー0-9０-９A-Za-zＡ-Ｚａ-ｚ]+")
 
 # 読み（A列）正規化: 濁点・半濁点（結合文字/分離記号）
 _DAKUTEN_MARKS = frozenset(("\u3099", "\u309a", "\u309b", "\u309c"))
@@ -105,9 +106,12 @@ def _replace_vu_in_reading(s: str) -> str:
 
 
 def _is_allowed_reading_char(ch: str) -> bool:
-    """機能2: ひらがな・数字・英字のみ許可（半角・全角）。"""
+    """機能2: ひらがな・長音・数字・英字のみ許可（半角・全角）。"""
     o = ord(ch)
     if 0x3041 <= o <= 0x3096:
+        return True
+    # 長音記号（カタカナ長音。読み列で「ー」を保持する）
+    if ch == "\u30fc":
         return True
     # 分離濁点/半濁点（「う゛」の゛を残す）
     if ch == "\u309b" or ch == "\u309c":
@@ -233,12 +237,12 @@ def convert_first_field(line: str) -> str:
     return "".join(out) + "\t" + rest
 
 def _blank_pos_column_in_tsv(line: str) -> str:
-    """TSVの品詞無し出力へ整形（語句・品詞は出さず、タブ2連続でコメント列へ）。
+    """TSVの品詞無し（省入力）出力へ整形。語句列は残し、品詞列のみ空にする。
 
     期待例（品詞無し）:
-    - ① 読み\t語句\t品詞\tコメント -> 読み\t\tコメント
-    - ② 読み\t品詞\tコメント -> 読み\t\tコメント
-    - ③ 読み\t語句\t品詞  コメント -> 読み\t\tコメント
+    - ① 読み\t語句\t品詞\tコメント -> 読み\t語句\t\tコメント
+    - ② 読み\t品詞\tコメント -> 読み\t\t\tコメント（語句欠落時は空欄）
+    - ③ 読み\t語句\t品詞  コメント -> 読み\t語句\t\tコメント
     """
     if "\t" not in line:
         return line
@@ -260,20 +264,19 @@ def _blank_pos_column_in_tsv(line: str) -> str:
             },
         )
     # #endregion
-    # 入力は基本 4 列想定だが、実データの揺れ（3 列など）でも
-    # コメントが消えないように「読み + 空欄列 + コメント」で統一する。
+    # 入力は基本 4 列想定。語句列を落とさず、品詞列のみ空にする。
     if len(parts) == 4:
         # [0]=読み, [1]=語句, [2]=品詞, [3]=コメント
-        return "\t".join([parts[0], "", parts[3]])
+        return "\t".join([parts[0], parts[1], "", parts[3]])
 
     if len(parts) == 3:
         # ケースA: 3列目が「品詞(単語)+  コメント」で2+スペース区切りになっている
         #   例: 読み\t語句\t名詞  拠点/造語
         m = _POS_COMMENT_SPLIT.match(parts[2])
         if m:
-            # 品詞は捨てて、コメントだけ残す（読み\t\tコメント）
+            # 品詞は捨て、語句は残す（読み\t語句\t\tコメント）
             comment = m.group(2).strip()
-            out = [parts[0], "", comment]
+            out = [parts[0], parts[1], "", comment]
             # #region agent log (pos blank normalize len=3 caseA)
             _debug_log(
                 hypothesisId="H1_COLCOUNT_FIX",
@@ -285,8 +288,8 @@ def _blank_pos_column_in_tsv(line: str) -> str:
             return "\t".join(out)
 
         # ケースB: 2列目が品詞で、3列目がコメント（語句列が欠落）
-        #   例: 読み\t名詞\tコメント
-        out = [parts[0], "", parts[2]]
+        #   例: 読み\t名詞\tコメント -> 読み\t\t\tコメント
+        out = [parts[0], "", "", parts[2]]
         # #region agent log (pos blank normalize len=3 caseB)
         _debug_log(
             hypothesisId="H1_COLCOUNT_FIX",
@@ -297,10 +300,11 @@ def _blank_pos_column_in_tsv(line: str) -> str:
         # #endregion
         return "\t".join(out)
 
-    # 想定外: 5列以上など。とにかく読み\t\tコメントにまとめる（コメントは最後）
+    # 想定外: 5列以上。読み・語句（2列目）を残し、品詞を空、コメントは最後
     reading = parts[0]
+    phrase = parts[1] if len(parts) > 1 else ""
     comment = parts[-1]
-    return "\t".join([reading, "", comment])
+    return "\t".join([reading, phrase, "", comment])
 
 def _convert_pos_column_exact(line: str) -> str:
     """TSVの3列目（品詞）を辞書で完全一致置換する。"""
@@ -318,6 +322,21 @@ def _convert_pos_column_exact(line: str) -> str:
 
     parts[2] = mapped
     return "\t".join(parts)
+
+
+def _only_pos_column_changed(before: str, after: str) -> bool:
+    """読み・語句・コメントは同一で、品詞列（0-based で index 2）だけが異なる行。"""
+    if "\t" not in before or "\t" not in after:
+        return False
+    a = before.split("\t")
+    b = after.split("\t")
+    if len(a) != len(b) or len(a) < 3:
+        return False
+    if len(a) == 4:
+        return a[0] == b[0] and a[1] == b[1] and a[3] == b[3] and a[2] != b[2]
+    if len(a) == 3:
+        return a[0] == b[0] and a[1] == b[1] and a[2] != b[2]
+    return False
 
 
 def convert_text(text: str, include_pos: bool = True):
@@ -364,14 +383,14 @@ def convert_text(text: str, include_pos: bool = True):
         else:
             new_ln = _blank_pos_column_in_tsv(new_ln)
         out_lines.append(new_ln)
-        if new_ln != ln:
+        if new_ln != ln and not _only_pos_column_changed(ln, new_ln):
             changed += 1
             diffs.append(f"[{idx}行目] {ln}  ⇒  {new_ln}")
     return "\n".join(out_lines), changed, "\n".join(diffs)
 
 # UI
 def main(page: ft.Page):
-    page.title = "Meriem ver.1.1"
+    page.title = "Meriem ver.1.2"
     page.window_min_width = 980
     page.window_min_height = 700
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -383,7 +402,7 @@ def main(page: ft.Page):
 
     stat = ft.Text("準備OK", size=12, color=ft.Colors.GREY_700)
     changed_txt = ft.Text("変更行: 0 / 総行数: 0", size=12)
-    include_pos = True  # True: 品詞あり（既存の出力と同じ）, False: 品詞無し（3列目を空欄）
+    include_pos = True  # True: 辞書（品詞あり）, False: 省入力（品詞列のみ空欄）
 
     mono = ft.TextStyle(font_family="Consolas", size=13)
     input_tf = ft.TextField(label="入力（原文）", multiline=True, read_only=True,
@@ -464,9 +483,9 @@ def main(page: ft.Page):
         if not output_text:
             set_status("出力がありません。", ok=False)
             return
-        default_name = (
-            f"{current_file.stem}_ATOK.txt" if current_file else "converted_ATOK変換.txt"
-        )
+        base = current_file.stem if current_file else "変換"
+        suffix = "" if include_pos else "(省入力)"
+        default_name = f"【ATOK】{base}{suffix}.txt"
         save_picker.save_file(file_name=default_name, allowed_extensions=["txt"])
 
     def on_save_result(e: ft.FilePickerResultEvent):
@@ -491,8 +510,8 @@ def main(page: ft.Page):
         refresh_output()
         page.update()
 
-    pos_yes_btn = ft.ElevatedButton("品詞あり", disabled=True, on_click=on_pos_yes_click)
-    pos_no_btn = ft.OutlinedButton("品詞無し", disabled=False, on_click=on_pos_no_click)
+    pos_yes_btn = ft.ElevatedButton("辞書", disabled=True, on_click=on_pos_yes_click)
+    pos_no_btn = ft.OutlinedButton("省入力", disabled=False, on_click=on_pos_no_click)
     pos_toggle = ft.Row(controls=[pos_yes_btn, pos_no_btn], spacing=10)
 
     top_bar = ft.Row(
