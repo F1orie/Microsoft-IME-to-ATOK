@@ -21,6 +21,45 @@ _VU_KATAKANA = "\u30f4"
 
 # 品詞ラベル（3列目）の完全一致置換辞書
 _POS_LABEL_MAP_RAW: dict[str, str] = {
+    "名詞": "名詞",
+    "副詞的名詞": "名詞",
+    "姓": "固有人姓",
+    "名": "固有人名",
+    "人名": "固有人他",
+    "地名その他": "固有地名",
+    "固有名詞": "固有一般",
+    "さ変名詞": "名詞サ変",
+    "ざ変名詞": "名詞ザ変",
+    "形動名詞": "名詞形動",
+    "さ変形動名詞": "名サ形動",
+    "さ変軽動名詞": "名サ形動",
+    "その他自立語": "独立語",
+    "慣用句": "独立語",
+    "固有接頭語": "接頭語",
+    "姓名接頭語": "接頭語",
+    "地名接頭語": "接頭語",
+    "固有接尾語": "接尾語",
+    "姓名接尾語": "接尾語",
+    "地名接尾語": "接尾語",
+    "か行五段": "カ行五段",
+    "が行五段": "ガ行五段",
+    "さ行五段": "サ行五段",
+    "た行五段": "タ行五段",
+    "な行五段": "ナ行五段",
+    "は行五段": "ハ行五段",
+    "ば行五段": "バ行五段",
+    "ま行五段": "マ行五段",
+    "ら行五段": "ラ行五段",
+    "あわ行五段": "ワ行五段",
+    "短縮よみ": "短縮読み",
+    "姓接尾語": "接尾語",
+    "名接尾語": "接尾語",
+    "姓接尾語": "接尾語",
+}
+
+"""
+# 品詞ラベル（3列目）の完全一致置換辞書
+_POS_LABEL_MAP_RAW: dict[str, str] = {
     "固有名詞": "固有一般",
     "姓": "固有人名",
     "地名その他": "固有地名",
@@ -37,7 +76,7 @@ _POS_LABEL_MAP_RAW: dict[str, str] = {
     "ら行五段": "ラ行五段",
     "あわ行五段": "アワ行五段",
 }
-
+"""
 # 念のため、キーは実装前に NFKC 正規化して同一化
 _POS_LABEL_MAP: dict[str, str] = {
     unicodedata.normalize("NFKC", k): v for k, v in _POS_LABEL_MAP_RAW.items()
@@ -339,6 +378,41 @@ def _only_pos_column_changed(before: str, after: str) -> bool:
     return False
 
 
+def _build_fullwidth_ascii_fold_table() -> dict[int, str]:
+    """差分表示用: U+FF01〜FF5E（全角英数・記号）と U+3000（和字間スペース）のみ半角へ寄せる。
+
+    文字列全体に NFKC をかけない（半角カナ→全角カナなどは区別を潰さない）。
+    """
+    t: dict[int, str] = {0x3000: " "}
+    for o in range(0xFF01, 0xFF5F):
+        t[o] = chr(o - 0xFEE0)
+    return t
+
+
+_FULLWIDTH_ASCII_FOLD_TABLE = _build_fullwidth_ascii_fold_table()
+
+
+def _fold_fullwidth_ascii_for_diff(s: str) -> str:
+    return "".join(_FULLWIDTH_ASCII_FOLD_TABLE.get(ord(ch), ch) for ch in s)
+
+
+def _only_reading_column_a_width_fold_change(before: str, after: str) -> bool:
+    """A列（1列目）だけが変わり、かつ折りたたみ比較で同一なら真。
+
+    タブ以降（語句・品詞・コメント等）が変換前後で完全一致しているときに限り、
+    A列の差が全角英数・記号・和字間スペース⇄半角のみである場合に差分から除外する。
+    """
+    if "\t" not in before or "\t" not in after:
+        return False
+    a0, arest = before.split("\t", 1)
+    b0, brest = after.split("\t", 1)
+    if arest != brest:
+        return False
+    if a0 == b0:
+        return False
+    return _fold_fullwidth_ascii_for_diff(a0) == _fold_fullwidth_ascii_for_diff(b0)
+
+
 def convert_text(text: str, include_pos: bool = True):
     """戻り値: (出力テキスト, 変更行数, 差分テキスト)"""
     in_lines = text.splitlines()
@@ -384,13 +458,17 @@ def convert_text(text: str, include_pos: bool = True):
             new_ln = _blank_pos_column_in_tsv(new_ln)
         out_lines.append(new_ln)
         if new_ln != ln and not _only_pos_column_changed(ln, new_ln):
+            if _only_reading_column_a_width_fold_change(ln, new_ln):
+                continue
+            if _fold_fullwidth_ascii_for_diff(ln) == _fold_fullwidth_ascii_for_diff(new_ln):
+                continue
             changed += 1
             diffs.append(f"[{idx}行目] {ln}  ⇒  {new_ln}")
     return "\n".join(out_lines), changed, "\n".join(diffs)
 
 # UI
 def main(page: ft.Page):
-    page.title = "Meriem ver.1.2"
+    page.title = "Meriem ver.2.0"
     page.window_min_width = 980
     page.window_min_height = 700
     page.theme_mode = ft.ThemeMode.LIGHT
