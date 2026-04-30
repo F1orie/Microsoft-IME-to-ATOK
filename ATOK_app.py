@@ -524,25 +524,33 @@ def convert_text(text: str, include_pos: bool = True):
         else:
             new_ln = _blank_pos_column_in_tsv(new_ln)
         out_lines.append(new_ln)
-        if new_ln != ln and not _only_pos_column_changed(ln, new_ln):
-            if _only_reading_column_a_width_fold_change(ln, new_ln):
+
+        # 差分比較の基準行:
+        # 省入力（品詞空欄化）では、入力側も同じく品詞空欄化したものを基準にする。
+        # これにより「品詞を空にしただけ」の差分を表示しない（他の差分条件は従来通り）。
+        base_ln = ln
+        if not include_pos:
+            base_ln = _blank_pos_column_in_tsv(ln) if "\t" in ln else ln
+
+        if new_ln != base_ln and not _only_pos_column_changed(base_ln, new_ln):
+            if _only_reading_column_a_width_fold_change(base_ln, new_ln):
                 continue
-            if _only_reading_a_width_or_digit_change_and_pos_label_normalization_only(ln, new_ln):
+            if _only_reading_a_width_or_digit_change_and_pos_label_normalization_only(base_ln, new_ln):
                 continue
-            if _fold_fullwidth_ascii_for_diff(ln) == _fold_fullwidth_ascii_for_diff(new_ln):
+            if _fold_fullwidth_ascii_for_diff(base_ln) == _fold_fullwidth_ascii_for_diff(new_ln):
                 continue
             # 数字: 全角・丸数字等 → 半角 1 桁（NFKC）だけの差は差分に出さない（A 列のみ変化のケースも含む）
             if _fold_fullwidth_ascii_for_diff(
-                _with_first_field_digit_canonicalized(ln)
+                _with_first_field_digit_canonicalized(base_ln)
             ) == _fold_fullwidth_ascii_for_diff(_with_first_field_digit_canonicalized(new_ln)):
                 continue
             changed += 1
-            diffs.append(f"[{idx}行目] {ln}  ⇒  {new_ln}")
+            diffs.append(f"[{idx}行目] {base_ln}  ⇒  {new_ln}")
     return "\n".join(out_lines), changed, "\n".join(diffs)
 
 # UI
 def main(page: ft.Page):
-    page.title = "Meriem ver.2.0"
+    page.title = "Meriem ver.2.0.1"
     page.window_min_width = 980
     page.window_min_height = 700
     page.theme_mode = ft.ThemeMode.LIGHT
