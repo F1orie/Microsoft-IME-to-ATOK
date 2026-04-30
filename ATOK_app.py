@@ -10,14 +10,16 @@ from pathlib import Path
 
 _ROMAN_RUN = re.compile(r"[A-Za-z']+|[Ａ-Ｚａ-ｚ＇]+")
 _POS_COMMENT_SPLIT = re.compile(r"^(\S+)\s{2,}(.*)$")
-# 長音記号「ー」(U+30FC) を読み列に許可
-_DISALLOWED_READING_CHARS = re.compile(r"[^ぁ-ゖ゛゜ー0-9０-９A-Za-zＡ-Ｚａ-ｚ]+")
+# 読み（A列）から削除する記号（ユーザー要件）:
+# 「」「、」「。」「，」「．」「・」およびスペース（全角/半角）
+_READING_STRIP_CHARS = re.compile(r"[「」、。，．・,.\u3000 ]+")
 
 # 読み（A列）正規化: 濁点・半濁点（結合文字/分離記号）
 _DAKUTEN_MARKS = frozenset(("\u3099", "\u309a", "\u309b", "\u309c"))
 # カタカナ「ヴ」→ ひらがな「う」+ 分離濁点「゛」（ゔ に合成されない表記）
 _U_VOICED = "\u3046\u309b"
 _VU_KATAKANA = "\u30f4"
+_VU_HIRAGANA_COMPOSED = "\u3094"
 
 # 品詞ラベル（3列目）の完全一致置換辞書
 _POS_LABEL_MAP_RAW: dict[str, str] = {
@@ -57,26 +59,6 @@ _POS_LABEL_MAP_RAW: dict[str, str] = {
     "姓接尾語": "接尾語",
 }
 
-"""
-# 品詞ラベル（3列目）の完全一致置換辞書
-_POS_LABEL_MAP_RAW: dict[str, str] = {
-    "固有名詞": "固有一般",
-    "姓": "固有人名",
-    "地名その他": "固有地名",
-    "さ変名詞": "名詞サ変",
-    "ざ変名詞": "名詞ザ変",
-    "か行五段": "カ行五段",
-    "が行五段": "ガ行五段",
-    "さ行五段": "サ行五段",
-    "た行五段": "タ行五段",
-    "な行五段": "ナ行五段",
-    "は行五段": "ハ行五段",
-    "ば行五段": "バ行五段",
-    "ま行五段": "マ行五段",
-    "ら行五段": "ラ行五段",
-    "あわ行五段": "アワ行五段",
-}
-"""
 # 念のため、キーは実装前に NFKC 正規化して同一化
 _POS_LABEL_MAP: dict[str, str] = {
     unicodedata.normalize("NFKC", k): v for k, v in _POS_LABEL_MAP_RAW.items()
@@ -144,6 +126,11 @@ def _replace_vu_in_reading(s: str) -> str:
     return s.replace(_VU_KATAKANA, _U_VOICED)
 
 
+def _canonicalize_vu_for_diff(s: str) -> str:
+    """差分除外用: ヴ/ゔ を う゛ に寄せて同一視する。"""
+    return s.replace(_VU_KATAKANA, _U_VOICED).replace(_VU_HIRAGANA_COMPOSED, _U_VOICED)
+
+
 def _is_allowed_reading_char(ch: str) -> bool:
     """機能2: ひらがな・長音・数字・英字のみ許可（半角・全角）。"""
     o = ord(ch)
@@ -167,10 +154,9 @@ def _is_allowed_reading_char(ch: str) -> bool:
 
 
 def _filter_reading_column(s: str) -> str:
-    """機能2: ひらがな・数字・英字以外を削除して左詰め。"""
+    """読み（A列）から指定の記号・スペースのみ削除して左詰め。"""
     s = unicodedata.normalize("NFC", s)
-    # 「、」「。」「．」「・」「？」「！」などの記号を除去
-    return _DISALLOWED_READING_CHARS.sub("", s)
+    return _READING_STRIP_CHARS.sub("", s)
 
 
 def _truncate_reading_at_count32(s: str) -> str:
@@ -395,6 +381,86 @@ _FULLWIDTH_ASCII_FOLD_TABLE = _build_fullwidth_ascii_fold_table()
 def _fold_fullwidth_ascii_for_diff(s: str) -> str:
     return "".join(_FULLWIDTH_ASCII_FOLD_TABLE.get(ord(ch), ch) for ch in s)
 
+def _pos_label_normalized_value(pos: str) -> str | None:
+    """品詞ラベル正規化（完全一致置換）の結果を返す。変化がなければ None。"""
+    pos_norm = unicodedata.normalize("NFKC", pos)
+    mapped = _POS_LABEL_MAP.get(pos_norm)
+    if mapped is None or mapped == pos:
+        return None
+    return mapped
+
+
+def _canonicalize_reading_decimal_digits_for_diff(s: str) -> str:
+    """差分除外用: 1 文字が NFKC でちょうど 1 桁の ASCII 数字になる場合のみ半角数字へ寄せる。
+
+    全角数字（U+FF10 など）、丸数字（U+2460 系）など、読み列で現れうる「数字の形状差」を同一視する。
+    英字の全角→半角（NFKC が 1 文字の英字）はここでは触らない（従来の ASCII フォールド側で扱う）。
+    """
+    out: list[str] = []
+    for ch in s:
+        nk = unicodedata.normalize("NFKC", ch)
+        if len(nk) == 1 and "0" <= nk <= "9":
+            out.append(nk)
+        else:
+            out.append(ch)
+    return "".join(out)
+
+
+def _with_first_field_digit_canonicalized(line: str) -> str:
+    """TSV なら 1 列目だけ _canonicalize_reading_decimal_digits_for_diff を適用。"""
+    if "\t" not in line:
+        return _canonicalize_reading_decimal_digits_for_diff(line)
+    a0, rest = line.split("\t", 1)
+    return _canonicalize_reading_decimal_digits_for_diff(a0) + "\t" + rest
+
+def _canonicalize_reading_column_a_for_diff(a0: str) -> str:
+    """差分除外用: A列を「指定記号削除 → 数字形状差の正規化 → 全角ASCIIの折りたたみ」で正規化。"""
+    a0 = _filter_reading_column(a0)
+    a0 = _canonicalize_vu_for_diff(a0)
+    a0 = _canonicalize_reading_decimal_digits_for_diff(a0)
+    return _fold_fullwidth_ascii_for_diff(a0)
+
+def _reading_a_fold_equivalent_for_diff(a0: str, b0: str) -> bool:
+    """読み（A列）の差が全角ASCII/スペース/数字形状差の範囲で同一なら True。"""
+    if a0 == b0:
+        return False
+    return _canonicalize_reading_column_a_for_diff(a0) == _canonicalize_reading_column_a_for_diff(b0)
+
+def _only_reading_a_width_or_digit_change_and_pos_label_normalization_only(
+    before: str, after: str
+) -> bool:
+    """差分除外用（辞書モード想定）:
+
+    - A列の差が「全角/半角（ASCII範囲）・和字間スペース・数字形状差」のみ
+    - それ以外の差が「品詞ラベルの完全一致置換（正規化）」のみ
+
+    例: 読みが「０ｃｍ… → 0cm…」かつ 品詞が「固有名詞 → 固有一般」のようなケースを差分から除外する。
+    """
+    if "\t" not in before or "\t" not in after:
+        return False
+    a = before.split("\t")
+    b = after.split("\t")
+    if len(a) != len(b) or len(a) < 3:
+        return False
+
+    # 読み（A列）は折りたたみ同一、ただし完全一致は除外条件にしない
+    if not _reading_a_fold_equivalent_for_diff(a[0], b[0]):
+        return False
+
+    # 語句列は同一であること（列構造が崩れるケースは対象外）
+    if len(a) >= 2 and a[1] != b[1]:
+        return False
+
+    # コメント列（4列TSV）の一致も要求
+    if len(a) == 4 and a[3] != b[3]:
+        return False
+
+    # 品詞列だけが「正規化置換」による差であること
+    normalized = _pos_label_normalized_value(a[2])
+    if normalized is None:
+        return False
+    return normalized == b[2]
+
 
 def _only_reading_column_a_width_fold_change(before: str, after: str) -> bool:
     """A列（1列目）だけが変わり、かつ折りたたみ比較で同一なら真。
@@ -410,7 +476,8 @@ def _only_reading_column_a_width_fold_change(before: str, after: str) -> bool:
         return False
     if a0 == b0:
         return False
-    return _fold_fullwidth_ascii_for_diff(a0) == _fold_fullwidth_ascii_for_diff(b0)
+    # 指定記号削除 + 数字形状差 + 全角ASCII折りたたみ まで同一なら差分にしない
+    return _canonicalize_reading_column_a_for_diff(a0) == _canonicalize_reading_column_a_for_diff(b0)
 
 
 def convert_text(text: str, include_pos: bool = True):
@@ -460,7 +527,14 @@ def convert_text(text: str, include_pos: bool = True):
         if new_ln != ln and not _only_pos_column_changed(ln, new_ln):
             if _only_reading_column_a_width_fold_change(ln, new_ln):
                 continue
+            if _only_reading_a_width_or_digit_change_and_pos_label_normalization_only(ln, new_ln):
+                continue
             if _fold_fullwidth_ascii_for_diff(ln) == _fold_fullwidth_ascii_for_diff(new_ln):
+                continue
+            # 数字: 全角・丸数字等 → 半角 1 桁（NFKC）だけの差は差分に出さない（A 列のみ変化のケースも含む）
+            if _fold_fullwidth_ascii_for_diff(
+                _with_first_field_digit_canonicalized(ln)
+            ) == _fold_fullwidth_ascii_for_diff(_with_first_field_digit_canonicalized(new_ln)):
                 continue
             changed += 1
             diffs.append(f"[{idx}行目] {ln}  ⇒  {new_ln}")
