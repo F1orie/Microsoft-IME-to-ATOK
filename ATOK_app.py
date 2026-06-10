@@ -20,6 +20,9 @@ _DAKUTEN_MARKS = frozenset(("\u3099", "\u309a", "\u309b", "\u309c"))
 _U_VOICED = "\u3046\u309b"
 _VU_KATAKANA = "\u30f4"
 _VU_HIRAGANA_COMPOSED = "\u3094"
+_READING_TRUNCATION_MARK = "＠"
+_OUTPUT_ENCODING = "cp932"
+_OUTPUT_FIELD_LABELS = ("A列(読み)", "B列(語句)", "C列(品詞)", "D列(コメント)")
 
 # 品詞ラベル（3列目）の完全一致置換辞書
 _POS_LABEL_MAP_RAW: dict[str, str] = {
@@ -122,8 +125,15 @@ def _reading_unit_weight(unit: str) -> int:
 
 
 def _replace_vu_in_reading(s: str) -> str:
-    """機能3: ヴ → う゛（結合濁点）。"""
-    return s.replace(_VU_KATAKANA, _U_VOICED)
+    """機能3: ヴ/ゔ → う゛（分離濁点）。"""
+    return s.replace(_VU_KATAKANA, _U_VOICED).replace(
+        _VU_HIRAGANA_COMPOSED, _U_VOICED
+    )
+
+
+def _make_reading_cp932_safe(s: str) -> str:
+    """読み列の保存時に cp932 で扱えない合成済み「ゔ」を分離表記に戻す。"""
+    return s.replace(_VU_HIRAGANA_COMPOSED, _U_VOICED)
 
 
 def _canonicalize_vu_for_diff(s: str) -> str:
@@ -160,7 +170,7 @@ def _filter_reading_column(s: str) -> str:
 
 
 def _truncate_reading_at_count32(s: str) -> str:
-    """機能1: 独自カウントで 32 以上なら 32 カウント目を @ にし、以降を削除。"""
+    """機能1: 独自カウントで 32 以上なら 32 カウント目を ＠ にし、以降を削除。"""
     s = unicodedata.normalize("NFC", s)
     units = _reading_units(s)
     if not units:
@@ -177,8 +187,8 @@ def _truncate_reading_at_count32(s: str) -> str:
             out.append(u)
             cum += w
         else:
-            # 32 カウント目がこのユニットにかかる → ユニット全体を @（仕様メモ）
-            out.append("@")
+            # 32 カウント目がこのユニットにかかる → ユニット全体を ＠（仕様メモ）
+            out.append(_READING_TRUNCATION_MARK)
             break
     return "".join(out)
 
@@ -189,7 +199,48 @@ def _normalize_reading_column_a(first: str) -> str:
     s = _replace_vu_in_reading(s)
     s = _filter_reading_column(s)
     s = _truncate_reading_at_count32(s)
+    s = _make_reading_cp932_safe(s)
     return s
+
+
+def _spreadsheet_column_name(index: int) -> str:
+    """0-based の列番号を A, B, ..., AA のような表記にする。"""
+    index += 1
+    name = ""
+    while index:
+        index, rem = divmod(index - 1, 26)
+        name = chr(ord("A") + rem) + name
+    return name
+
+
+def _output_field_label(index: int) -> str:
+    if index < len(_OUTPUT_FIELD_LABELS):
+        return _OUTPUT_FIELD_LABELS[index]
+    return f"{_spreadsheet_column_name(index)}列"
+
+
+def find_output_encoding_errors(
+    text: str, sample_limit: int = 20
+) -> tuple[int, set[int], list[str]]:
+    """出力を cp932 保存できない文字の件数、対象行、表示用の対象一覧を返す。"""
+    total = 0
+    error_line_numbers: set[int] = set()
+    samples: list[str] = []
+    for line_no, line in enumerate(text.splitlines(), start=1):
+        fields = line.split("\t")
+        for field_index, field in enumerate(fields):
+            field_label = _output_field_label(field_index)
+            for ch in field:
+                try:
+                    ch.encode(_OUTPUT_ENCODING)
+                except UnicodeEncodeError:
+                    total += 1
+                    error_line_numbers.add(line_no)
+                    if len(samples) < sample_limit:
+                        samples.append(
+                            f"{line_no}行目 {field_label}: 「{ch}」(U+{ord(ch):04X})"
+                        )
+    return total, error_line_numbers, samples
 
 
 # 対象子音（nは除外）
@@ -550,7 +601,7 @@ def convert_text(text: str, include_pos: bool = True):
 
 # UI
 def main(page: ft.Page):
-    page.title = "Meriem ver.2.0.1"
+    page.title = "Meriem ver.2.0.2"
     page.window_min_width = 980
     page.window_min_height = 700
     page.theme_mode = ft.ThemeMode.LIGHT
@@ -613,11 +664,51 @@ def main(page: ft.Page):
         if not output_text:
             set_status("出力がありません。先にファイルを開いてください。", ok=False)
             return
+        save_text = output_text
+        error_count, error_line_numbers, error_samples = find_output_encoding_errors(output_text)
+        if error_count:
+            hidden_count = error_count - len(error_samples)
+            removed_line_count = len(error_line_numbers)
+            details = [
+                "保存できない文字があります（ANSI/cp932非対応）。",
+                f"対象の {removed_line_count} 行を除外して保存します。",
+                "",
+                *error_samples,
+            ]
+            if hidden_count > 0:
+                details.append(f"...ほか {hidden_count} 件")
+            diff_tf.value = "\n".join(details)
+            save_text = "\n".join(
+                line
+                for line_no, line in enumerate(output_text.splitlines(), start=1)
+                if line_no not in error_line_numbers
+            )
+            if not save_text:
+                set_status(
+                    "保存失敗: 保存可能な行がありません。詳細は差分欄を確認してください。",
+                    ok=False,
+                )
+                return
+            try:
+                save_text.encode(_OUTPUT_ENCODING)
+            except UnicodeEncodeError as e:
+                set_status(f"保存失敗: {e}", ok=False)
+                return
+            page.update()
         try:
-            Path(to_path).write_text(output_text, encoding="cp932", newline="\r\n")
-            set_status(f"保存しました: {to_path}", ok=True)
+            Path(to_path).write_text(save_text, encoding=_OUTPUT_ENCODING, newline="\r\n")
+            if error_count:
+                set_status(
+                    f"保存しました: {to_path}（保存不可文字を含む {len(error_line_numbers)} 行を除外）",
+                    ok=True,
+                )
+            else:
+                set_status(f"保存しました: {to_path}", ok=True)
         except Exception as e:
-            set_status(f"保存失敗: {e}", ok=False)
+            set_status(
+                f"保存失敗: {e}",
+                ok=False,
+            )
 
     def on_open_click(e):
         open_picker.pick_files(
