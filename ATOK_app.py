@@ -20,7 +20,7 @@ _DAKUTEN_MARKS = frozenset(("\u3099", "\u309a", "\u309b", "\u309c"))
 _U_VOICED = "\u3046\u309b"
 _VU_KATAKANA = "\u30f4"
 _VU_HIRAGANA_COMPOSED = "\u3094"
-_READING_TRUNCATION_MARK = "＠"
+_READING_TRUNCATION_MARK = "@"
 _OUTPUT_ENCODING = "cp932"
 _OUTPUT_FIELD_LABELS = ("A列(読み)", "B列(語句)", "C列(品詞)", "D列(コメント)")
 
@@ -170,7 +170,7 @@ def _filter_reading_column(s: str) -> str:
 
 
 def _truncate_reading_at_count32(s: str) -> str:
-    """機能1: 独自カウントで 32 以上なら 32 カウント目を ＠ にし、以降を削除。"""
+    """機能1: 独自カウントで 32 以上なら 32 カウント目を @ にし、以降を削除。"""
     s = unicodedata.normalize("NFC", s)
     units = _reading_units(s)
     if not units:
@@ -187,7 +187,7 @@ def _truncate_reading_at_count32(s: str) -> str:
             out.append(u)
             cum += w
         else:
-            # 32 カウント目がこのユニットにかかる → ユニット全体を ＠（仕様メモ）
+            # 32 カウント目がこのユニットにかかる → ユニット全体を @（仕様メモ）
             out.append(_READING_TRUNCATION_MARK)
             break
     return "".join(out)
